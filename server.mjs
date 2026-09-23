@@ -8,8 +8,17 @@ const TIMEOUT_MS = 15000;
 
 // ── WebSocket Bridge ─────────────────────────────────────────────────────────
 let pluginSocket = null;
-let pendingRequests = new Map(); // id -> { resolve, reject, timer }
+let pendingRequests = new Map(); // id -> { resolve, reject, timer, action, params }
 let requestId = 0;
+
+function isPermissionError(message) {
+  return typeof message === "string" && message.includes("not-allowed:");
+}
+
+function toCuratedPermissionError(action, params, rawMessage) {
+  const where = params?.channel_id || params?.guild_id || params?.user_id || "this scope";
+  return `You are not allowed to do ${action} in ${where}. ${rawMessage} Check Vencord MCPBridge settings (allowedGuildIds, allowDMs, readonlyMode).`;
+}
 
 const wss = new WebSocketServer({ port: WS_PORT });
 
@@ -41,7 +50,11 @@ wss.on("connection", (ws) => {
         clearTimeout(pending.timer);
         pendingRequests.delete(msg.id);
         if (msg.error) {
-          pending.reject(new Error(msg.error));
+          if (isPermissionError(msg.error)) {
+            pending.reject(new Error(toCuratedPermissionError(pending.action, pending.params, msg.error)));
+          } else {
+            pending.reject(new Error(msg.error));
+          }
         } else {
           pending.resolve(msg.result);
         }
@@ -77,7 +90,7 @@ function callPlugin(action, params = {}) {
       reject(new Error(`Timeout waiting for plugin response (action: ${action})`));
     }, TIMEOUT_MS);
 
-    pendingRequests.set(id, { resolve, reject, timer });
+    pendingRequests.set(id, { resolve, reject, timer, action, params });
     pluginSocket.send(JSON.stringify({ id, action, params }));
   });
 }

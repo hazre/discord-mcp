@@ -1,3 +1,5 @@
 node_modules/
 vencord-src/
 .mcp.json
+CONTEXT.md
+docs/
