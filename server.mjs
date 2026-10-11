@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { WebSocketServer } from "ws";
+import { execSync } from "child_process";
 import { z } from "zod";
 
 const WS_PORT = 7890;
@@ -20,63 +21,122 @@ function toCuratedPermissionError(action, params, rawMessage) {
   return `You are not allowed to do ${action} in ${where}. ${rawMessage} Check Vencord MCPBridge settings (allowedGuildIds, allowDMs, readonlyMode).`;
 }
 
-const wss = new WebSocketServer({ port: WS_PORT });
-
-wss.on("error", (err) => {
-  if (err.code === "EADDRINUSE") {
-    console.error(`[bridge] Port ${WS_PORT} in use — killing old process and retrying...`);
-    import("child_process").then(({ execSync }) => {
-      try {
-        const out = execSync(`netstat -ano | findstr :${WS_PORT}`, { encoding: "utf8" });
-        const pid = out.trim().split(/\s+/).pop();
-        if (pid && pid !== "0") execSync(`taskkill /F /PID ${pid}`);
-        setTimeout(() => { wss.listen(WS_PORT); }, 500);
-      } catch { console.error("[bridge] Could not recover — restart manually"); }
-    });
-  } else {
-    console.error("[bridge] WebSocket error:", err.message);
-  }
-});
-
-wss.on("connection", (ws) => {
-  console.error("[bridge] Vencord plugin connected");
-  pluginSocket = ws;
-
-  ws.on("message", (raw) => {
+// Find the PID currently listening on `port`, cross-platform. Returns null
+// when it cannot be determined. Previously this only handled Windows
+// (netstat/findstr + taskkill), so on Linux/macOS every second instance
+// silently became a port-less orphan while clients kept talking to it.
+function findPortHolderPid(port) {
+  try {
+    if (process.platform === "win32") {
+      const out = execSync(`netstat -ano | findstr :${port}`, { encoding: "utf8" });
+      const match = out.match(/LISTENING\s+(\d+)/i);
+      const pid = match ? parseInt(match[1], 10) : NaN;
+      return Number.isFinite(pid) && pid !== 0 ? pid : null;
+    }
     try {
-      const msg = JSON.parse(raw.toString());
-      const pending = pendingRequests.get(msg.id);
-      if (pending) {
-        clearTimeout(pending.timer);
-        pendingRequests.delete(msg.id);
-        if (msg.error) {
-          if (isPermissionError(msg.error)) {
-            pending.reject(new Error(toCuratedPermissionError(pending.action, pending.params, msg.error)));
-          } else {
-            pending.reject(new Error(msg.error));
-          }
-        } else {
-          pending.resolve(msg.result);
-        }
+      const out = execSync("ss -tlnp", { encoding: "utf8" });
+      for (const line of out.split("\n")) {
+        if (!line.includes(`:${port} `)) continue;
+        const match = line.match(/pid=(\d+)/);
+        if (match) return parseInt(match[1], 10);
       }
-    } catch (e) {
-      console.error("[bridge] Bad message from plugin:", e.message);
+    } catch {
+      // ss missing (non-Linux Unix): fall through to lsof.
+    }
+    const out = execSync(`lsof -ti tcp:${port}`, { encoding: "utf8" });
+    const pid = parseInt(out.trim().split(/\s+/)[0], 10);
+    return Number.isFinite(pid) ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+function killPid(pid) {
+  try {
+    if (process.platform === "win32") {
+      execSync(`taskkill /F /PID ${pid}`);
+    } else {
+      process.kill(pid, "SIGKILL");
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+let listenAttempts = 0;
+
+function startBridge() {
+  const wss = new WebSocketServer({ port: WS_PORT });
+
+  wss.on("error", (err) => {
+    if (err.code !== "EADDRINUSE") {
+      console.error("[bridge] WebSocket error:", err.message);
+      return;
+    }
+    if (process.env.DISCORD_MCP_NO_TAKEOVER) {
+      console.error(`[bridge] Port ${WS_PORT} in use and takeover disabled (DISCORD_MCP_NO_TAKEOVER) — restart manually`);
+      return;
+    }
+    if (listenAttempts >= 2) {
+      console.error(`[bridge] Port ${WS_PORT} still in use after takeover — restart manually`);
+      return;
+    }
+    listenAttempts++;
+    console.error(`[bridge] Port ${WS_PORT} in use — killing old process and retrying...`);
+    try { wss.close(); } catch { /* never opened; nothing to close */ }
+    const pid = findPortHolderPid(WS_PORT);
+    if (pid && pid !== process.pid && killPid(pid)) {
+      setTimeout(startBridge, 500);
+    } else {
+      console.error("[bridge] Could not recover — restart manually");
     }
   });
 
-  ws.on("close", () => {
-    console.error("[bridge] Vencord plugin disconnected");
-    pluginSocket = null;
-    // Reject all pending requests
-    for (const [id, p] of pendingRequests) {
-      clearTimeout(p.timer);
-      p.reject(new Error("Plugin disconnected"));
-    }
-    pendingRequests.clear();
+  wss.on("listening", () => {
+    console.error(`[bridge] WebSocket server listening on ws://localhost:${WS_PORT}`);
   });
-});
 
-console.error(`[bridge] WebSocket server listening on ws://localhost:${WS_PORT}`);
+  wss.on("connection", (ws) => {
+    console.error("[bridge] Vencord plugin connected");
+    pluginSocket = ws;
+
+    ws.on("message", (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        const pending = pendingRequests.get(msg.id);
+        if (pending) {
+          clearTimeout(pending.timer);
+          pendingRequests.delete(msg.id);
+          if (msg.error) {
+            if (isPermissionError(msg.error)) {
+              pending.reject(new Error(toCuratedPermissionError(pending.action, pending.params, msg.error)));
+            } else {
+              pending.reject(new Error(msg.error));
+            }
+          } else {
+            pending.resolve(msg.result);
+          }
+        }
+      } catch (e) {
+        console.error("[bridge] Bad message from plugin:", e.message);
+      }
+    });
+
+    ws.on("close", () => {
+      console.error("[bridge] Vencord plugin disconnected");
+      pluginSocket = null;
+      // Reject all pending requests
+      for (const [id, p] of pendingRequests) {
+        clearTimeout(p.timer);
+        p.reject(new Error("Plugin disconnected"));
+      }
+      pendingRequests.clear();
+    });
+  });
+}
+
+startBridge();
 
 function callPlugin(action, params = {}) {
   return new Promise((resolve, reject) => {
