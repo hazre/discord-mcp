@@ -1,10 +1,10 @@
 /*
  * Vencord MCP Bridge Plugin
- * Connects to the MCP server's WebSocket and executes Discord actions.
+ * Executes Discord actions for the MCP endpoint hosted by native.ts.
  * Drop this folder into Vencord's src/userplugins/MCPBridge/
  */
 
-import definePlugin, { OptionType } from "@utils/types";
+import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { definePluginSettings } from "@api/Settings";
 import { findByPropsLazy, findStoreLazy } from "@webpack";
 import { FluxDispatcher, RestAPI, UserStore, ChannelStore, GuildStore, PermissionStore, PermissionsBits } from "@webpack/common";
@@ -88,72 +88,43 @@ function requireGuildPerm(perm: any, guildId: string, action: string, permName: 
     }
 }
 
-// ── WebSocket Connection ─────────────────────────────────────────────────────
+// ── Native Bridge Connection (IPC long-poll) ─────────────────────────────────
 
-const WS_URL = "ws://127.0.0.1:7890";
-const RECONNECT_INTERVAL = 5000;
+const Native = VencordNative.pluginHelpers.MCPBridge as PluginNative<typeof import("./native")>;
+const POLL_BACKOFF_MS = 5000;
 
-let ws: WebSocket | null = null;
-let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let enabled = false;
+let pollGeneration = 0;
 
-function connect() {
-    if (!enabled) return;
-    if (ws && ws.readyState <= 1) return; // already connected or connecting
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-    try {
-        ws = new WebSocket(WS_URL);
+function nativeAvailable(): boolean {
+    return Boolean(VencordNative?.pluginHelpers?.MCPBridge?.poll);
+}
 
-        ws.onopen = () => {
-            console.log("[MCPBridge] Connected to MCP server");
-        };
-
-        ws.onmessage = async (event) => {
+async function pollLoop() {
+    const generation = ++pollGeneration;
+    while (enabled && generation === pollGeneration) {
+        let call: Awaited<ReturnType<typeof Native.poll>>;
+        try {
+            call = await Native.poll();
+        } catch (e: any) {
+            if (!enabled || generation !== pollGeneration) return;
+            console.warn("[MCPBridge] Poll rejected:", e?.message ?? e);
+            await sleep(POLL_BACKOFF_MS);
+            continue;
+        }
+        if (!call || !enabled || generation !== pollGeneration) continue;
+        try {
+            const result = await handleAction(call.action, call.params ?? {});
+            await Native.complete(call.id, result);
+        } catch (e: any) {
             try {
-                const msg = JSON.parse(event.data);
-                const { id, action, params } = msg;
-                try {
-                    const result = await handleAction(action, params || {});
-                    ws?.send(JSON.stringify({ id, result }));
-                } catch (e: any) {
-                    ws?.send(JSON.stringify({ id, error: e.message || String(e) }));
-                }
-            } catch (e) {
-                console.error("[MCPBridge] Bad message:", e);
+                await Native.complete(call.id, null, e?.message || String(e));
+            } catch (reportError: any) {
+                console.error("[MCPBridge] Failed to report error:", reportError?.message ?? reportError);
             }
-        };
-
-        ws.onclose = () => {
-            console.log("[MCPBridge] Disconnected from MCP server");
-            ws = null;
-            scheduleReconnect();
-        };
-
-        ws.onerror = () => {
-            // onclose will fire after this
-            ws?.close();
-        };
-    } catch (e) {
-        console.error("[MCPBridge] Connection error:", e);
-        scheduleReconnect();
-    }
-}
-
-function scheduleReconnect() {
-    if (!enabled) return;
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(connect, RECONNECT_INTERVAL);
-}
-
-function disconnect() {
-    if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-    }
-    if (ws) {
-        ws.onclose = null; // prevent reconnect
-        ws.close();
-        ws = null;
+        }
     }
 }
 
@@ -599,14 +570,18 @@ export default definePlugin({
     settings,
 
     start() {
+        if (!nativeAvailable()) {
+            console.error("[MCPBridge] Native bridge module missing — rebuild Vencord with vencord-plugin/native.ts");
+            return;
+        }
         enabled = true;
-        connect();
-        console.log("[MCPBridge] Plugin started — connecting to MCP server...");
+        void pollLoop();
+        console.log("[MCPBridge] Plugin started — waiting for MCP tool calls");
     },
 
     stop() {
         enabled = false;
-        disconnect();
+        if (nativeAvailable()) Native.detach().catch(() => { });
         console.log("[MCPBridge] Plugin stopped");
     }
 });
